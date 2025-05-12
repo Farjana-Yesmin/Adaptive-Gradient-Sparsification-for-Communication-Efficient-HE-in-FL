@@ -1,0 +1,350 @@
+{
+  "cells": [
+    {
+      "cell_type": "markdown",
+      "metadata": {
+        "id": "view-in-github"
+      },
+      "source": [
+        "# Privacy-Preserving LLM Framework\n",
+        "\n",
+        "This notebook implements a federated learning framework with DistilBERT and simulated encryption for privacy-preserving machine learning on a Chest X-Ray dataset."
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "install-dependencies"
+      },
+      "outputs": [],
+      "source": [
+        "# Install required dependencies\n",
+        "!pip install transformers==4.41.2 torch==2.3.0 torchvision==0.18.0 cryptography==42.0.0 syft==0.9.1 matplotlib==3.9.0 pandas==2.2.2 scikit-learn==1.5.0\n",
+        "\n",
+        "# For GPU (uncomment if using GPU in Colab)\n",
+        "# !pip install torch==2.3.0 torchvision==0.18.0 --index-url https://download.pytorch.org/whl/cu121"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "imports"
+      },
+      "outputs": [],
+      "source": [
+        "# Import libraries\n",
+        "import logging\n",
+        "import numpy as np\n",
+        "import torch\n",
+        "import matplotlib.pyplot as plt\n",
+        "import time\n",
+        "from transformers import DistilBertTokenizer, DistilBertForSequenceClassification, Trainer, TrainingArguments\n",
+        "from torch.utils.data import Dataset\n",
+        "from torch.optim import AdamW\n",
+        "from sklearn.model_selection import train_test_split\n",
+        "from sklearn.metrics import accuracy_score, f1_score\n",
+        "import os\n",
+        "import glob\n",
+        "from kaggle.api.kaggle_api_extended import KaggleApi\n",
+        "\n",
+        "# Set up logging\n",
+        "logging.basicConfig(level=logging.INFO)\n",
+        "logger = logging.getLogger(__name__)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "data-loading"
+      },
+      "outputs": [],
+      "source": [
+        "# Load Chest X-Ray dataset from Kaggle\n",
+        "os.environ['KAGGLE_USERNAME'] = 'your_kaggle_username'  # Replace with your Kaggle username\n",
+        "os.environ['KAGGLE_KEY'] = 'your_kaggle_api_key'       # Replace with your Kaggle API key\n",
+        "\n",
+        "api = KaggleApi()\n",
+        "api.authenticate()\n",
+        "api.dataset_download_files('paultimothymooney/chest-xray-pneumonia', path='./chest_xray', unzip=True)\n",
+        "\n",
+        "normal_files = glob.glob('./chest_xray/chest_xray/train/NORMAL/*.jpeg')\n",
+        "pneumonia_files = glob.glob('./chest_xray/chest_xray/train/PNEUMONIA/*.jpeg')\n",
+        "radiology_reports = [f'X-ray image {os.path.basename(f)}' for f in normal_files + pneumonia_files]\n",
+        "chest_xray_labels = [0] * len(normal_files) + [1] * len(pneumonia_files)\n",
+        "\n",
+        "val_normal_files = glob.glob('./chest_xray/chest_xray/val/NORMAL/*.jpeg')\n",
+        "val_pneumonia_files = glob.glob('./chest_xray/chest_xray/val/PNEUMONIA/*.jpeg')\n",
+        "chest_val_texts = [f'Val X-ray image {os.path.basename(f)}' for f in val_normal_files + val_pneumonia_files]\n",
+        "chest_val_labels = [0] * len(val_normal_files) + [1] * len(val_pneumonia_files)\n",
+        "\n",
+        "logger.info(f'Training data: {len(radiology_reports)} reports, {len(chest_xray_labels)} labels')\n",
+        "logger.info(f'Validation data: {len(chest_val_texts)} reports, {len(chest_val_labels)} labels')\n",
+        "\n",
+        "assert len(radiology_reports) == len(chest_xray_labels), 'Mismatch in training data lengths'\n",
+        "assert len(chest_val_texts) == len(chest_val_labels), 'Mismatch in validation data lengths'"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "text-dataset"
+      },
+      "outputs": [],
+      "source": [
+        "# Define TextDataset class\n",
+        "class TextDataset(Dataset):\n",
+        "    def __init__(self, texts, labels, tokenizer, max_length=128):\n",
+        "        self.texts = texts\n",
+        "        self.labels = labels\n",
+        "        self.tokenizer = tokenizer\n",
+        "        self.max_length = max_length\n",
+        "\n",
+        "    def __len__(self):\n",
+        "        return len(self.texts)\n",
+        "\n",
+        "    def __getitem__(self, idx):\n",
+        "        text = str(self.texts[idx])\n",
+        "        label = self.labels[idx]\n",
+        "        encoding = self.tokenizer(\n",
+        "            text,\n",
+        "            add_special_tokens=True,\n",
+        "            max_length=self.max_length,\n",
+        "            padding='max_length',\n",
+        "            truncation=True,\n",
+        "            return_tensors='pt'\n",
+        "        )\n",
+        "        return {\n",
+        "            'input_ids': encoding['input_ids'].squeeze(),\n",
+        "            'attention_mask': encoding['attention_mask'].squeeze(),\n",
+        "            'labels': torch.tensor(label, dtype=torch.long)\n",
+        "        }"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "compute-metrics"
+      },
+      "outputs": [],
+      "source": [
+        "# Define compute_metrics function\n",
+        "def compute_metrics(eval_pred):\n",
+        "    logits, labels = eval_pred\n",
+        "    predictions = np.argmax(logits, axis=-1)\n",
+        "    acc = accuracy_score(labels, predictions)\n",
+        "    f1 = f1_score(labels, predictions, average='weighted')\n",
+        "    return {'accuracy': acc, 'f1': f1}"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "initialize-model"
+      },
+      "outputs": [],
+      "source": [
+        "# Initialize tokenizer and global model\n",
+        "chest_tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')\n",
+        "chest_model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2)"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "encryption-functions"
+      },
+      "outputs": [],
+      "source": [
+        "# Simulated Encryption Functions\n",
+        "def simulate_encrypt_weights(weights):\n",
+        "    noise = [np.random.normal(0, 0.01 * np.abs(w).mean(), w.shape) for w in weights]\n",
+        "    encrypted = [w + n for w, n in zip(weights, noise)]\n",
+        "    return encrypted, noise\n",
+        "\n",
+        "def simulate_decrypt_weights(encrypted_weights, noise):\n",
+        "    return [w - n for w, n in zip(encrypted_weights, noise)]"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "federated-learning"
+      },
+      "outputs": [],
+      "source": [
+        "# Federated Learning with DistilBERT and Simulated Encryption\n",
+        "num_clients = 3\n",
+        "chest_client_data = []\n",
+        "train_reports, chest_val_texts, train_labels, chest_val_labels = train_test_split(\n",
+        "    radiology_reports, chest_xray_labels, test_size=0.2, random_state=42\n",
+        ")\n",
+        "for i in range(num_clients):\n",
+        "    start_idx = i * len(train_reports) // num_clients\n",
+        "    end_idx = (i + 1) * len(train_reports) // num_clients\n",
+        "    client_reports = train_reports[start_idx:end_idx]\n",
+        "    client_labels = train_labels[start_idx:end_idx]\n",
+        "    client_val_texts_split = chest_val_texts[i * len(chest_val_texts) // num_clients:(i + 1) * len(chest_val_texts) // num_clients]\n",
+        "    client_val_labels_split = chest_val_labels[i * len(chest_val_labels) // num_clients:(i + 1) * len(chest_val_labels) // num_clients]\n",
+        "    if not client_reports or not client_val_texts_split:\n",
+        "        logger.error(f'Client {i}: Empty dataset detected')\n",
+        "        raise ValueError(f'Client {i} has empty dataset')\n",
+        "    logger.info(f'Client {i}: Train samples: {len(client_reports)}, Val samples: {len(client_val_texts_split)}')\n",
+        "    chest_client_data.append((client_reports, client_labels, client_val_texts_split, client_val_labels_split))\n",
+        "\n",
+        "global_model = chest_model\n",
+        "client_predictions = []\n",
+        "client_weights = []\n",
+        "encryption_times = []\n",
+        "decryption_times = []\n",
+        "\n",
+        "for round in range(3):\n",
+        "    round_client_models = []\n",
+        "    round_client_weights = []\n",
+        "    for client_idx, (client_reports, client_labels, client_val_texts, client_val_labels) in enumerate(chest_client_data):\n",
+        "        try:\n",
+        "            client_train_dataset = TextDataset(client_reports, client_labels, chest_tokenizer)\n",
+        "            client_val_dataset = TextDataset(client_val_texts, client_val_labels, chest_tokenizer)\n",
+        "\n",
+        "            client_model = DistilBertForSequenceClassification.from_pretrained('distilbert-base-uncased', num_labels=2)\n",
+        "            client_trainer = Trainer(\n",
+        "                model=client_model,\n",
+        "                args=TrainingArguments(\n",
+        "                    output_dir=f'./results_client_{client_idx}',\n",
+        "                    num_train_epochs=1,\n",
+        "                    per_device_train_batch_size=8,\n",
+        "                    per_device_eval_batch_size=8,\n",
+        "                    warmup_steps=500,\n",
+        "                    weight_decay=0.01,\n",
+        "                    logging_dir=f'./logs_client_{client_idx}',\n",
+        "                    logging_steps=10,\n",
+        "                    dataloader_pin_memory=False\n",
+        "                ),\n",
+        "                train_dataset=client_train_dataset,\n",
+        "                eval_dataset=client_val_dataset,\n",
+        "                compute_metrics=compute_metrics,\n",
+        "                optimizers=(AdamW(client_model.parameters(), lr=5e-5), None)\n",
+        "            )\n",
+        "\n",
+        "            client_trainer.train()\n",
+        "            val_results = client_trainer.evaluate()\n",
+        "            val_f1 = val_results['eval_f1']\n",
+        "            round_client_weights.append(val_f1)\n",
+        "            logger.info(f'Client {client_idx}: Validation F1 = {val_f1:.4f}')\n",
+        "\n",
+        "            start_time = time.time()\n",
+        "            model_weights = [param.data.cpu().numpy() for param in client_model.parameters()]\n",
+        "            encrypted_weights, noise = simulate_encrypt_weights(model_weights)\n",
+        "            encryption_times.append(time.time() - start_time)\n",
+        "            round_client_models.append((encrypted_weights, noise))\n",
+        "        except Exception as e:\n",
+        "            logger.error(f'Error in client {client_idx} training: {e}')\n",
+        "            raise\n",
+        "\n",
+        "    try:\n",
+        "        aggregated_weights = []\n",
+        "        aggregated_noise = []\n",
+        "        for layer_idx in range(len(round_client_models[0][0])):\n",
+        "            layer_weights = [client_model[0][layer_idx] for client_model in round_client_models]\n",
+        "            layer_noise = [client_model[1][layer_idx] for client_model in round_client_models]\n",
+        "            total_weight = sum(round_client_weights)\n",
+        "            weighted_sum = np.zeros_like(layer_weights[0])\n",
+        "            for client_idx in range(num_clients):\n",
+        "                client_weight = round_client_weights[client_idx] / total_weight\n",
+        "                weighted_sum += client_weight * layer_weights[client_idx]\n",
+        "            aggregated_weights.append(weighted_sum)\n",
+        "            aggregated_noise.append(layer_noise[0])\n",
+        "\n",
+        "        start_time = time.time()\n",
+        "        decrypted_weights = simulate_decrypt_weights(aggregated_weights, aggregated_noise)\n",
+        "        decryption_times.append(time.time() - start_time)\n",
+        "\n",
+        "        with torch.no_grad():\n",
+        "            for param, dec_w in zip(global_model.parameters(), decrypted_weights):\n",
+        "                param.copy_(torch.tensor(dec_w, dtype=param.dtype))\n",
+        "    except Exception as e:\n",
+        "        logger.error(f'Error in weight aggregation: {e}')\n",
+        "        raise\n",
+        "\n",
+        "    try:\n",
+        "        predictions_per_client = []\n",
+        "        for client_idx, (client_reports, _, client_val_texts, client_val_labels) in enumerate(chest_client_data):\n",
+        "            client_val_dataset = TextDataset(client_val_texts, client_val_labels, chest_tokenizer)\n",
+        "            preds = client_trainer.predict(client_val_dataset).predictions.argmax(-1)\n",
+        "            predictions_per_client.append(preds)\n",
+        "        client_predictions.append(predictions_per_client)\n",
+        "        client_weights.append(round_client_weights)\n",
+        "        logger.info(f'Round {round+1}/3 completed')\n",
+        "    except Exception as e:\n",
+        "        logger.error(f'Error in prediction collection: {e}')\n",
+        "        raise"
+      ]
+    },
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "output-metrics"
+      },
+      "outputs": [],
+      "source": [
+        "# Output Metrics and Visualize Results\n",
+        "try:\n",
+        "    final_predictions = []\n",
+        "    final_labels = []\n",
+        "    for round_preds in client_predictions:\n",
+        "        for client_preds in round_preds:\n",
+        "            final_predictions.extend(client_preds)\n",
+        "    for _, _, _, client_val_labels in chest_client_data:\n",
+        "        final_labels.extend(client_val_labels)\n",
+        "\n",
+        "    min_length = min(len(final_predictions), len(final_labels))\n",
+        "    final_predictions = final_predictions[:min_length]\n",
+        "    final_labels = final_labels[:min_length]\n",
+        "\n",
+        "    final_accuracy = accuracy_score(final_labels, final_predictions)\n",
+        "    final_f1 = f1_score(final_labels, final_predictions, average='weighted')\n",
+        "    avg_encryption_time = np.mean(encryption_times) if encryption_times else 0\n",
+        "    avg_decryption_time = np.mean(decryption_times) if decryption_times else 0\n",
+        "\n",
+        "    logger.info(f'Chest X-Ray Final Federated Accuracy: {final_accuracy:.4f}')\n",
+        "    logger.info(f'Chest X-Ray Final Federated F1 Score: {final_f1:.4f}')\n",
+        "    logger.info(f'Average Encryption Time: {avg_encryption_time:.4f} seconds')\n",
+        "    logger.info(f'Average Decryption Time: {avg_decryption_time:.4f} seconds')\n",
+        "\n",
+        "    plt.figure(figsize=(10, 6))\n",
+        "    plt.subplot(1, 2, 1)\n",
+        "    plt.bar(['Accuracy', 'F1 Score'], [final_accuracy, final_f1])\n",
+        "    plt.title('Federated Learning Metrics (Chest X-Ray)')\n",
+        "    plt.subplot(1, 2, 2)\n",
+        "    plt.bar(['Encryption Time', 'Decryption Time'], [avg_encryption_time, avg_decryption_time])\n",
+        "    plt.title('Computational Overhead')\n",
+        "    plt.savefig('metrics_plot.png')\n",
+        "    plt.close()\n",
+        "    logger.info(\"Metrics plot saved as 'metrics_plot.png'.\")\n",
+        "except Exception as e:\n",
+        "    logger.error(f'Error calculating Chest X-Ray metrics: {e}')\n",
+        "    raise"
+      ]
+    }
+  ],
+  "metadata": {
+    "kernelspec": {
+      "display_name": "Python 3",
+      "language": "python",
+      "name": "python3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "nbformat": 4,
+  "nbformat_minor": 0
+}
