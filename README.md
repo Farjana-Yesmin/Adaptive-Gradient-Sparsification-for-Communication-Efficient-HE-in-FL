@@ -1,4 +1,4 @@
-# Privacy_Preserving_LLM_Framework
+# Adaptive Gradient Sparsification for Communication-Efficient Homomorphic Encryption in Federated Learning
 # Privacy-Preserving Healthcare Models
 
 This repository contains a work-in-progress implementation of a federated learning framework for privacy-preserving healthcare models using DistilBERT and simulated encryption. The goal is to develop AI systems that protect patient data while enabling robust healthcare predictions, with potential applications in neurosymbolic AI for ethical decision-making.
